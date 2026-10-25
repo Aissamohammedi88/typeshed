@@ -1,0 +1,103 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# POST-RELEASE VERIFICATION
+# ═══════════════════════════════════════════════════════════════════════════════
+# "A release is not done when it's published. It's done when it's verified."
+# This workflow runs immediately after a GitHub Release is published.
+# It ensures that:
+#   1. The artifact is actually available on PyPI (with a retry loop).
+#   2. It can be installed on all supported OS/Python combinations.
+#   3. The installed version matches the release tag.
+# This catches PyPI propagation delays, broken wheels, and metadata mismatches.
+# ═══════════════════════════════════════════════════════════════════════════════
+name: Release Verification
+on:
+  release:
+    types: [published]
+permissions:
+  contents: read
+jobs:
+  verify-pypi:
+    name: "🔍 Verify PyPI (${{ matrix.os }} / Python ${{ matrix.python-version }})"
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        # typing_extensions supports Python 3.8+
+        python-version: ["3.8", "3.10", "3.12", "3.13"]
+    steps:
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Wait for PyPI Propagation
+        shell: bash
+        run: |
+          # PyPI can take a few seconds to propagate a new release.
+          # We retry for up to 5 minutes.
+          VERSION="${{ github.event.release.tag_name }}"
+          VERSION="${VERSION#v}" # Remove 'v' prefix if present
+          echo "Waiting for typing_extensions==$VERSION on PyPI..."
+          for i in {1..30}; do
+            if pip index versions typing_extensions | grep -q "$VERSION"; then
+              echo "✓ Version $VERSION is available on PyPI."
+              exit 0
+            fi
+            echo "Attempt $i/30: Not available yet. Retrying in 10s..."
+            sleep 10
+          done
+          echo "::error::Timeout waiting for PyPI to propagate version $VERSION."
+          exit 1
+      - name: Install from PyPI
+        shell: bash
+        run: |
+          VERSION="${{ github.event.release.tag_name }}"
+          VERSION="${VERSION#v}"
+          pip install "typing_extensions==$VERSION"
+      - name: Verify Version and Basic Functionality
+        shell: bash
+        run: |
+          python -c "
+          import typing_extensions
+          from typing_extensions import TypeAlias, TypeGuard, TypeVarTuple
+          expected_version = '${{ github.event.release.tag_name }}'.lstrip('v')
+          assert typing_extensions.__version__ == expected_version, \
+              f'Version mismatch: expected {expected_version}, got {typing_extensions.__version__}'
+          print(f'✓ Version {typing_extensions.__version__} is installed.')
+          print('✓ Core types (TypeAlias, TypeGuard, TypeVarTuple) import successfully.')
+          "
+  verify-sdist:
+    name: "📦 Verify Source Distribution"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Wait for PyPI Propagation
+        shell: bash
+        run: |
+          VERSION="${{ github.event.release.tag_name }}"
+          VERSION="${VERSION#v}"
+          for i in {1..30}; do
+            if pip index versions typing_extensions | grep -q "$VERSION"; then
+              echo "✓ Version $VERSION is available."
+              exit 0
+            fi
+            sleep 10
+          done
+          exit 1
+      - name: Download and Inspect Source Distribution
+        shell: bash
+        run: |
+          VERSION="${{ github.event.release.tag_name }}"
+          VERSION="${VERSION#v}"
+          # Download the sdist
+          pip download "typing_extensions==$VERSION" --no-binary :all: --no-deps
+          # Extract and verify
+          tar -xzf "typing_extensions-$VERSION.tar.gz"
+          cd "typing_extensions-$VERSION"
+          # Check that key files exist
+          test -f "src/typing_extensions.py" || (echo "::error::Missing source file" && exit 1)
+          test -f "LICENSE" || (echo "::error::Missing LICENSE" && exit 1)
+          echo "✓ Source distribution is valid and contains expected files."
